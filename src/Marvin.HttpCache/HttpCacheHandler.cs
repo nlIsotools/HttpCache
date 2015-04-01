@@ -101,7 +101,7 @@ namespace Marvin.HttpCache
 
        }
 
-       private Task<HttpResponseMessage> HandleHttpPutOrPatch(HttpRequestMessage request,
+       private async Task<HttpResponseMessage> HandleHttpPutOrPatch(HttpRequestMessage request,
            System.Threading.CancellationToken cancellationToken)
        {
 
@@ -118,11 +118,11 @@ namespace Marvin.HttpCache
                HttpResponseMessage responseFromCache = null;
 
                // available in cache?
-               var responseFromCacheAsTask = _cacheStore.GetAsync(cacheKey);
-               if (responseFromCacheAsTask.Result != null)
+               var cacheEntryFromCache = await _cacheStore.GetAsync(cacheKey);
+               if (cacheEntryFromCache != null)
                {
                    addCachingHeaders = true;
-                   responseFromCache = responseFromCacheAsTask.Result.HttpResponse;
+                   responseFromCache = cacheEntryFromCache.HttpResponse;
                }
 
                if (addCachingHeaders)
@@ -143,11 +143,11 @@ namespace Marvin.HttpCache
                }
            }
            
-           return HandleSendAndContinuationForPutPatch(cacheKey, request, cancellationToken);
+           return await HandleSendAndContinuationForPutPatch(cacheKey, request, cancellationToken);
        }
 
 
-       private Task<HttpResponseMessage> HandleHttpGet(HttpRequestMessage request, 
+       private async Task<HttpResponseMessage> HandleHttpGet(HttpRequestMessage request, 
            System.Threading.CancellationToken cancellationToken)
        {
            // get VaryByHeaders - order in the request shouldn't matter, so order them so the
@@ -157,7 +157,6 @@ namespace Marvin.HttpCache
            string primaryCacheKey = CacheKeyHelpers.CreatePrimaryCacheKey(request);// request.RequestUri.ToString();
            bool responseIsCached = false;
            HttpResponseMessage responseFromCache = null;
-           IEnumerable<CacheEntry> cacheEntriesFromCache = null;
 
            // first, before even looking at the cache:
            // The Cache-Control: no-cache HTTP/1.1 header field is also intended for use in requests made by the client. 
@@ -167,7 +166,7 @@ namespace Marvin.HttpCache
            if (request.Headers.CacheControl != null && request.Headers.CacheControl.NoCache)
            {
                // Don't get from cache.  Get from server.
-               return HandleSendAndContinuation(
+               return await HandleSendAndContinuation(
                    CacheKeyHelpers.CreateCacheKey(primaryCacheKey), request, cancellationToken, false); 
            }
 
@@ -175,11 +174,9 @@ namespace Marvin.HttpCache
 
 
            // available in cache?
-           var cacheEntriesFromCacheAsTask = _cacheStore.GetAsync(primaryCacheKey);
-           if (cacheEntriesFromCacheAsTask.Result != default(IEnumerable<CacheEntry>))
+           var cacheEntriesFromCache = await _cacheStore.GetAsync(primaryCacheKey);
+           if (cacheEntriesFromCache != default(IEnumerable<CacheEntry>))
            {
-               cacheEntriesFromCache = cacheEntriesFromCacheAsTask.Result;
-
                // TODO: for all of these, check the varyby headers (secondary key).  
                // An item is a match if secondary & primary keys both match!
                responseFromCache = cacheEntriesFromCache.First().HttpResponse;
@@ -217,20 +214,20 @@ namespace Marvin.HttpCache
                             responseFromCache.Content.Headers.LastModified.Value.ToString("r"));
 				    }
 
-                    return HandleSendAndContinuation(
+                    return await HandleSendAndContinuation(
                         CacheKeyHelpers.CreateCacheKey(primaryCacheKey), request, cancellationToken, true);
                }
                else
                {
                    // response is allowed to be cached and there's
                    // no need to revalidate: return the cached response
-                   return Task.FromResult(responseFromCache);  
+                   return responseFromCache;  
                }
            }
            else
            {
                // response isn't cached.  Get it, and (possibly) add it to cache.
-               return HandleSendAndContinuation(
+               return await HandleSendAndContinuation(
                    CacheKeyHelpers.CreateCacheKey(primaryCacheKey), request, cancellationToken, false); 
            }
 
@@ -238,114 +235,94 @@ namespace Marvin.HttpCache
        }
 
 
-       private Task<HttpResponseMessage> HandleSendAndContinuation(CacheKey cacheKey, HttpRequestMessage request,
+       private async Task<HttpResponseMessage> HandleSendAndContinuation(CacheKey cacheKey, HttpRequestMessage request,
          System.Threading.CancellationToken cancellationToken, bool mustRevalidate)
        {
+           var serverResponse = await base.SendAsync(request, cancellationToken);
+           // if we had to revalidate & got a 304 returned, that means
+           // we can get the response message from cache.
+           if (mustRevalidate && serverResponse.StatusCode == HttpStatusCode.NotModified)
+           {
+                var cacheEntry = await _cacheStore.GetAsync(cacheKey);
+                var responseFromCacheEntry = cacheEntry.HttpResponse;
+                responseFromCacheEntry.RequestMessage = request;
 
-           return base.SendAsync(request, cancellationToken)
-                   .ContinueWith(
-                    task =>
-                    {
+                return responseFromCacheEntry;
+           }
 
-                        var serverResponse = task.Result;
+           if (serverResponse.IsSuccessStatusCode)
+           {
 
-                        // if we had to revalidate & got a 304 returned, that means
-                        // we can get the response message from cache.
-                        if (mustRevalidate && serverResponse.StatusCode == HttpStatusCode.NotModified)
-                        {
-                            var cacheEntry = _cacheStore.GetAsync(cacheKey).Result;
-                            var responseFromCacheEntry = cacheEntry.HttpResponse;
-                            responseFromCacheEntry.RequestMessage = request;
+                // ensure no NULL dates
+                if (serverResponse.Headers.Date == null)
+                {
+                    serverResponse.Headers.Date = DateTimeOffset.UtcNow;
+                }
 
-                            return responseFromCacheEntry;
-                        }
+                // check the response: is this response allowed to be cached?
+                bool isCacheable = HttpResponseHelpers.CanBeCached(serverResponse);
 
-                        if (serverResponse.IsSuccessStatusCode)
-                        {
-
-                            // ensure no NULL dates
-                            if (serverResponse.Headers.Date == null)
-                            {
-                                serverResponse.Headers.Date = DateTimeOffset.UtcNow;
-                            }
-
-                            // check the response: is this response allowed to be cached?
-                            bool isCacheable = HttpResponseHelpers.CanBeCached(serverResponse);
-
-                            if (isCacheable)
-                            {
-                                // add the response to cache
-                                _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
-                            }
+                if (isCacheable)
+                {
+                    // add the response to cache
+                    await _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
+                }
 
 
-                            // what about vary by headers (=> key should take this into account)?
+                // what about vary by headers (=> key should take this into account)?
                             
-                        }
+           }
 
-                        return serverResponse;
-                    });
+           return serverResponse;
        }
 
 
- 
 
-       private Task<HttpResponseMessage> HandleSendAndContinuationForPutPatch(CacheKey cacheKey, HttpRequestMessage request,
+
+       private async Task<HttpResponseMessage> HandleSendAndContinuationForPutPatch(CacheKey cacheKey, HttpRequestMessage request,
            System.Threading.CancellationToken cancellationToken)
        {
+           var serverResponse = await base.SendAsync(request, cancellationToken);
+           if (serverResponse.IsSuccessStatusCode)
+           {
+               // ensure no NULL dates
+               if (serverResponse.Headers.Date == null)
+               {
+                   serverResponse.Headers.Date = DateTimeOffset.UtcNow;
+               }
 
-           return base.SendAsync(request, cancellationToken)
-                   .ContinueWith(
-                    task =>
-                    {
+               // should we clear?
 
-                        var serverResponse = task.Result;
+               if ((_enableClearRelatedResourceRepresentationsAfterPut && request.Method == HttpMethod.Put)
+                   ||
+                   (_enableClearRelatedResourceRepresentationsAfterPatch && request.Method.Method.ToLower() == "patch"))
+               {
+                   // clear related resources 
+                   // 
+                   // - remove resource with cachekey.  This must be done, as there's no 
+                   // guarantee the new response is cacheable.
+                   //
+                   // - look for resources in cache that start with 
+                   // the cachekey + "?" for querystring.
 
-                        if (serverResponse.IsSuccessStatusCode)
-                        {
+                   await _cacheStore.RemoveAsync(cacheKey);
+                   await _cacheStore.RemoveRangeAsync(cacheKey.PrimaryKey + "?");
+               }
 
-                            // ensure no NULL dates
-                            if (serverResponse.Headers.Date == null)
-                            {
-                                serverResponse.Headers.Date = DateTimeOffset.UtcNow;
-                            }
 
-                            // should we clear?
+               // check the response: is this response allowed to be cached?
+               bool isCacheable = HttpResponseHelpers.CanBeCached(serverResponse);
 
-                            if ((_enableClearRelatedResourceRepresentationsAfterPut && request.Method == HttpMethod.Put)
-                                ||
-                                (_enableClearRelatedResourceRepresentationsAfterPatch && request.Method.Method.ToLower() == "patch"))
-                            {
-                                // clear related resources 
-                                // 
-                                // - remove resource with cachekey.  This must be done, as there's no 
-                                // guarantee the new response is cacheable.
-                                //
-                                // - look for resources in cache that start with 
-                                // the cachekey + "?" for querystring.
+               if (isCacheable)
+               {
+                   // add the response to cache
+                   await _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
+               }
 
-                                _cacheStore.RemoveAsync(cacheKey);
-                                _cacheStore.RemoveRangeAsync(cacheKey.PrimaryKey + "?");
-                            } 
+               // what about vary by headers (=> key should take this into account)?
 
-                            
-                            // check the response: is this response allowed to be cached?
-                            bool isCacheable = HttpResponseHelpers.CanBeCached(serverResponse);
-
-                            if (isCacheable)
-                            {
-                                // add the response to cache
-                                _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
-                            }
-                            
-                            // what about vary by headers (=> key should take this into account)?
-
-                        }
-
-                        return serverResponse;
-
-                    });
+           }
+           return serverResponse;
        }
-
    }
 }
