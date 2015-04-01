@@ -101,7 +101,7 @@ namespace Marvin.HttpCache
 
        }
 
-       private Task<HttpResponseMessage> HandleHttpPutOrPatch(HttpRequestMessage request,
+       private async Task<HttpResponseMessage> HandleHttpPutOrPatch(HttpRequestMessage request,
            System.Threading.CancellationToken cancellationToken)
        {
 
@@ -118,11 +118,11 @@ namespace Marvin.HttpCache
                HttpResponseMessage responseFromCache = null;
 
                // available in cache?
-               var responseFromCacheAsTask = _cacheStore.GetAsync(cacheKey);
-               if (responseFromCacheAsTask.Result != null)
+               var cacheEntry = await _cacheStore.GetAsync(cacheKey);
+               if (cacheEntry != null)
                {
                    addCachingHeaders = true;
-                   responseFromCache = responseFromCacheAsTask.Result.HttpResponse;
+                   responseFromCache = cacheEntry.HttpResponse;
                }
 
                if (addCachingHeaders)
@@ -143,11 +143,11 @@ namespace Marvin.HttpCache
                }
            }
            
-           return HandleSendAndContinuationForPutPatch(cacheKey, request, cancellationToken);
+           return await HandleSendAndContinuationForPutPatch(cacheKey, request, cancellationToken);
        }
 
 
-       private Task<HttpResponseMessage> HandleHttpGet(HttpRequestMessage request, 
+       private async Task<HttpResponseMessage> HandleHttpGet(HttpRequestMessage request, 
            System.Threading.CancellationToken cancellationToken)
        {
            // get VaryByHeaders - order in the request shouldn't matter, so order them so the
@@ -167,7 +167,7 @@ namespace Marvin.HttpCache
            if (request.Headers.CacheControl != null && request.Headers.CacheControl.NoCache)
            {
                // Don't get from cache.  Get from server.
-               return HandleSendAndContinuation(
+               return await HandleSendAndContinuation(
                    CacheKeyHelpers.CreateCacheKey(primaryCacheKey), request, cancellationToken, false); 
            }
 
@@ -175,11 +175,9 @@ namespace Marvin.HttpCache
 
 
            // available in cache?
-           var cacheEntriesFromCacheAsTask = _cacheStore.GetAsync(primaryCacheKey);
-           if (cacheEntriesFromCacheAsTask.Result != default(IEnumerable<CacheEntry>))
+           cacheEntriesFromCache = await _cacheStore.GetAsync(primaryCacheKey);
+           if (cacheEntriesFromCache != default(IEnumerable<CacheEntry>))
            {
-               cacheEntriesFromCache = cacheEntriesFromCacheAsTask.Result;
-
                // TODO: for all of these, check the varyby headers (secondary key).  
                // An item is a match if secondary & primary keys both match!
                responseFromCache = cacheEntriesFromCache.First().HttpResponse;
@@ -217,20 +215,20 @@ namespace Marvin.HttpCache
                             responseFromCache.Content.Headers.LastModified.Value.ToString("r"));
 				    }
 
-                    return HandleSendAndContinuation(
+                    return await HandleSendAndContinuation(
                         CacheKeyHelpers.CreateCacheKey(primaryCacheKey), request, cancellationToken, true);
                }
                else
                {
                    // response is allowed to be cached and there's
                    // no need to revalidate: return the cached response
-                   return Task.FromResult(responseFromCache);  
+                   return responseFromCache;  
                }
            }
            else
            {
                // response isn't cached.  Get it, and (possibly) add it to cache.
-               return HandleSendAndContinuation(
+               return await HandleSendAndContinuation(
                    CacheKeyHelpers.CreateCacheKey(primaryCacheKey), request, cancellationToken, false); 
            }
 
@@ -238,22 +236,17 @@ namespace Marvin.HttpCache
        }
 
 
-       private Task<HttpResponseMessage> HandleSendAndContinuation(CacheKey cacheKey, HttpRequestMessage request,
+       private async Task<HttpResponseMessage> HandleSendAndContinuation(CacheKey cacheKey, HttpRequestMessage request,
          System.Threading.CancellationToken cancellationToken, bool mustRevalidate)
        {
 
-           return base.SendAsync(request, cancellationToken)
-                   .ContinueWith(
-                    task =>
-                    {
-
-                        var serverResponse = task.Result;
+           var serverResponse = await base.SendAsync(request, cancellationToken);
 
                         // if we had to revalidate & got a 304 returned, that means
                         // we can get the response message from cache.
                         if (mustRevalidate && serverResponse.StatusCode == HttpStatusCode.NotModified)
                         {
-                            var cacheEntry = _cacheStore.GetAsync(cacheKey).Result;
+                            var cacheEntry = await _cacheStore.GetAsync(cacheKey);
                             var responseFromCacheEntry = cacheEntry.HttpResponse;
                             responseFromCacheEntry.RequestMessage = request;
 
@@ -275,7 +268,7 @@ namespace Marvin.HttpCache
                             if (isCacheable)
                             {
                                 // add the response to cache
-                                _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
+                                await _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
                             }
 
 
@@ -284,22 +277,17 @@ namespace Marvin.HttpCache
                         }
 
                         return serverResponse;
-                    });
+
        }
 
 
  
 
-       private Task<HttpResponseMessage> HandleSendAndContinuationForPutPatch(CacheKey cacheKey, HttpRequestMessage request,
+       private async Task<HttpResponseMessage> HandleSendAndContinuationForPutPatch(CacheKey cacheKey, HttpRequestMessage request,
            System.Threading.CancellationToken cancellationToken)
        {
 
-           return base.SendAsync(request, cancellationToken)
-                   .ContinueWith(
-                    task =>
-                    {
-
-                        var serverResponse = task.Result;
+           var serverResponse = await base.SendAsync(request, cancellationToken);
 
                         if (serverResponse.IsSuccessStatusCode)
                         {
@@ -324,8 +312,8 @@ namespace Marvin.HttpCache
                                 // - look for resources in cache that start with 
                                 // the cachekey + "?" for querystring.
 
-                                _cacheStore.RemoveAsync(cacheKey);
-                                _cacheStore.RemoveRangeAsync(cacheKey.PrimaryKey + "?");
+                                await _cacheStore.RemoveAsync(cacheKey);
+                                await _cacheStore.RemoveRangeAsync(cacheKey.PrimaryKey + "?");
                             } 
 
                             
@@ -335,7 +323,7 @@ namespace Marvin.HttpCache
                             if (isCacheable)
                             {
                                 // add the response to cache
-                                _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
+                                await _cacheStore.SetAsync(cacheKey, new CacheEntry(serverResponse));
                             }
                             
                             // what about vary by headers (=> key should take this into account)?
@@ -343,8 +331,6 @@ namespace Marvin.HttpCache
                         }
 
                         return serverResponse;
-
-                    });
        }
 
    }
